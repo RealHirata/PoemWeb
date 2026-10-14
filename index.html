@@ -1,0 +1,1286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>诗句之网 · PoemWeb</title>
+<style>
+  :root {
+    --bg: #d8dce2;
+    --ink: #202020;
+    --dim: #666;
+    --brush: "STXingkai", "华文行楷", "HanziPen SC", "STKaiti", "KaiTi", "楷体", "FZShuTi", serif;
+    --reading: "Songti SC", "Noto Serif SC", "Source Han Serif SC", "STSong", "SimSun", "宋体", serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  body { font-family: var(--brush); user-select: none; -webkit-user-select: none; }
+
+  #stage { position: fixed; inset: 0; display: block; cursor: grab; }
+  /* 暗角：盖在画布之上、界面之下，不拦截鼠标 */
+  #vignette {
+    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    background: radial-gradient(ellipse 75% 75% at 50% 50%, rgba(0,0,0,0) 45%, rgba(0,0,0,0.16) 78%, rgba(0,0,0,0.38) 100%);
+  }
+  #stage.dragging { cursor: grabbing; }
+  #readingAuthor { position: fixed; z-index: 2; pointer-events: none;
+    font-family: var(--reading); color: #62666d; line-height: 1; white-space: nowrap; }
+  #readingAuthor[hidden] { display: none; }
+  #readingAuthor a { color: inherit; pointer-events: auto; text-decoration: underline;
+    text-decoration-color: #959aa2; text-underline-offset: 3px; }
+  #readingAuthor a:hover, #readingAuthor a:focus-visible { color: #202020; }
+
+
+
+
+
+  #exitFocusBtn {
+    position: fixed; top: 24px; left: 50%; transform: translateX(-50%);
+    z-index: 6; cursor: pointer;
+    color: rgba(32,32,32,0.42); font-family: var(--reading);
+    font-size: 12px; letter-spacing: .08em;
+    padding: 8px 12px; border: 0;
+    background: transparent;
+    opacity: 0; pointer-events: none;
+    transition: opacity .4s ease, color .25s;
+  }
+  #exitFocusBtn.show { opacity: 1; pointer-events: auto; }
+  #exitFocusBtn:hover { color: rgba(32,32,32,0.72); }
+  #exitFocusBtn:focus-visible { color: rgba(32,32,32,0.72);
+    outline: 1px solid rgba(32,32,32,0.25); outline-offset: 2px; }
+
+
+  @media (max-width: 640px) {
+    #exitFocusBtn { top: 16px; font-size: 11px; padding: 8px 12px; }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+<div id="vignette"></div>
+
+<button id="exitFocusBtn">← 返回全景</button>
+<span id="readingAuthor" hidden></span>
+
+
+
+<script src="data/web/poems.js"></script>
+<script src="data/web/clusters.js"></script>
+<script src="data/web/authors.js"></script>
+<script id="physicsSource">
+"use strict";
+// 球壳上的伪物理松弛。只依赖点数与边表，既可在 Web Worker 中运行，也可在主线程直接调用。
+// 所有点从球心附近的一小团出发，在相互排斥下均匀向外膨胀，最终停在内外半径之间的球壳里；
+// 诗内相邻句子由弦相连，结点共享同一个物理点。
+const PHYSICS = {
+  SEED_R: 0.06,          // 初始线团半径（球半径为 1）
+  R_IN: 0.8, R_OUT: 1,   // 球壳内外半径
+  SHELL_K: 2,            // 越出球壳时的回拉系数
+  MID_K: 0.2,            // 壳内朝中间半径的微弱径向回拉，让点分布在整个厚度里
+  REST_LEN: 0.11,        // 相邻诗句间"弦"的自然长度
+  EDGE_K: 2,
+  REPEL_K: 3e-6,
+  SPREAD_K: 0.3,         // 方向重心回正，避免整张网向某一半球收缩
+  ISOTROPY_K: 0.2,       // 方向二阶矩回到各向同性，避免只铺在赤道或两极
+  SOFTENING_SQ: 0.0133 * 0.0133,
+  THETA_SQ: 0.8 * 0.8,   // Barnes–Hut 开角
+  STEP: 0.5,
+  DAMPING: 0.72,
+  MAX_SPEED: 0.012,
+  COOLING: 0.995,
+  SLEEP_HEAT: 0.01,
+  QUIET_SPEED: 2e-5
+};
+
+function createPhysics(count, edges, seed) {
+  const C = PHYSICS;
+  const pos = new Float64Array(count * 3), vel = new Float64Array(count * 3), force = new Float64Array(count * 3);
+  let heat = 1, quietSteps = 0, sleeping = false;
+
+  let s = seed | 0;
+  const rand = () => {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = 0; i < count; i++) {
+    const z = 2 * rand() - 1, a = rand() * Math.PI * 2, rr = Math.sqrt(1 - z * z);
+    const r = C.SEED_R * Math.cbrt(rand());
+    pos[i * 3] = r * rr * Math.cos(a); pos[i * 3 + 1] = r * rr * Math.sin(a); pos[i * 3 + 2] = r * z;
+  }
+
+  // Barnes–Hut 八叉树：近处逐点计算，远处按重心合并。
+  let cap = count * 8, cells = count > 0 ? alloc(cap) : null, cellCount = 0;
+  const next = new Int32Array(count);
+  const stack = new Int32Array(8 * 64);
+  function alloc(n) {
+    return {
+      x: new Float64Array(n), y: new Float64Array(n), z: new Float64Array(n), size: new Float64Array(n),
+      count: new Int32Array(n), sx: new Float64Array(n), sy: new Float64Array(n), sz: new Float64Array(n),
+      head: new Int32Array(n), leaf: new Uint8Array(n), child: new Int32Array(n * 8)
+    };
+  }
+  function makeCell(x, y, z, size) {
+    if (cellCount >= cap) throw new RangeError("octree full");
+    const id = cellCount++;
+    cells.x[id] = x; cells.y[id] = y; cells.z[id] = z; cells.size[id] = size;
+    cells.count[id] = 0; cells.sx[id] = 0; cells.sy[id] = 0; cells.sz[id] = 0;
+    cells.head[id] = -1; cells.leaf[id] = 1;
+    cells.child.fill(-1, id * 8, id * 8 + 8);
+    return id;
+  }
+  function insertChild(id, i, depth) {
+    const half = cells.size[id] / 2;
+    const bx = pos[i * 3] >= cells.x[id] + half, by = pos[i * 3 + 1] >= cells.y[id] + half, bz = pos[i * 3 + 2] >= cells.z[id] + half;
+    const slot = id * 8 + (bx ? 1 : 0) + (by ? 2 : 0) + (bz ? 4 : 0);
+    if (cells.child[slot] < 0) {
+      const c = makeCell(cells.x[id] + (bx ? half : 0), cells.y[id] + (by ? half : 0), cells.z[id] + (bz ? half : 0), half);
+      cells.child[slot] = c;
+    }
+    insert(cells.child[slot], i, depth + 1);
+  }
+  function insert(id, i, depth) {
+    cells.count[id]++; cells.sx[id] += pos[i * 3]; cells.sy[id] += pos[i * 3 + 1]; cells.sz[id] += pos[i * 3 + 2];
+    if (cells.leaf[id]) {
+      // 重合点保存在同一叶子，避免无限细分。
+      if (cells.head[id] < 0 || depth >= 24) { next[i] = cells.head[id]; cells.head[id] = i; return; }
+      const previous = cells.head[id];
+      cells.head[id] = -1; cells.leaf[id] = 0;
+      insertChild(id, previous, depth);
+    }
+    insertChild(id, i, depth);
+  }
+  function build() {
+    let lo = Infinity, hi = -Infinity;
+    for (let k = 0; k < pos.length; k++) { if (pos[k] < lo) lo = pos[k]; if (pos[k] > hi) hi = pos[k]; }
+    const size = Math.max(hi - lo, 1e-6) * 1.001;
+    for (;;) {
+      try {
+        cellCount = 0;
+        makeCell(lo, lo, lo, size);
+        for (let i = 0; i < count; i++) insert(0, i, 0);
+        return;
+      } catch (e) {
+        if (!(e instanceof RangeError)) throw e;
+        cap *= 2; cells = alloc(cap);
+      }
+    }
+  }
+
+  function repulsion() {
+    build();
+    const { x: cx, y: cy, z: cz, size, count: n, sx, sy, sz, head, leaf, child } = cells;
+    for (let i = 0; i < count; i++) {
+      const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
+      let fx = 0, fy = 0, fz = 0, top = 0;
+      stack[top++] = 0;
+      while (top) {
+        const id = stack[--top];
+        if (leaf[id]) {
+          for (let j = head[id]; j >= 0; j = next[j]) {
+            if (j === i) continue;
+            const dx = px - pos[j * 3], dy = py - pos[j * 3 + 1], dz = pz - pos[j * 3 + 2];
+            const d2 = dx * dx + dy * dy + dz * dz + C.SOFTENING_SQ;
+            const f = C.REPEL_K / (d2 * Math.sqrt(d2));
+            fx += dx * f; fy += dy * f; fz += dz * f;
+          }
+          continue;
+        }
+        const m = n[id], dx = px - sx[id] / m, dy = py - sy[id] / m, dz = pz - sz[id] / m;
+        const d2 = dx * dx + dy * dy + dz * dz, w = size[id];
+        const inside = px >= cx[id] && px <= cx[id] + w && py >= cy[id] && py <= cy[id] + w && pz >= cz[id] && pz <= cz[id] + w;
+        if (!inside && w * w < C.THETA_SQ * d2) {
+          const safe = d2 + C.SOFTENING_SQ;
+          const f = C.REPEL_K * m / (safe * Math.sqrt(safe));
+          fx += dx * f; fy += dy * f; fz += dz * f;
+        } else {
+          for (let k = id * 8, e = k + 8; k < e; k++) if (child[k] >= 0) stack[top++] = child[k];
+        }
+      }
+      force[i * 3] += fx; force[i * 3 + 1] += fy; force[i * 3 + 2] += fz;
+    }
+  }
+
+  function step() {
+    if (sleeping) return;
+    force.fill(0);
+    repulsion();
+
+    // 诗内相邻句子的弦
+    for (let e = 0; e < edges.length; e += 2) {
+      const a = edges[e] * 3, b = edges[e + 1] * 3;
+      const dx = pos[b] - pos[a], dy = pos[b + 1] - pos[a + 1], dz = pos[b + 2] - pos[a + 2];
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-9;
+      const k = (d - C.REST_LEN) * C.EDGE_K / d;
+      force[a] += dx * k; force[a + 1] += dy * k; force[a + 2] += dz * k;
+      force[b] -= dx * k; force[b + 1] -= dy * k; force[b + 2] -= dz * k;
+    }
+
+    // 弹簧可将整张图拖到一侧。只在切向平衡方向分布，保留球心向外
+    // 膨胀与球壳的径向厚度；不把布局投影为平面或固定到某个半球。
+    let mx = 0, my = 0, mz = 0, xx = 0, yy = 0, zz = 0, xy = 0, xz = 0, yz = 0;
+    for (let i = 0; i < count; i++) {
+      const o = i * 3, r = Math.hypot(pos[o], pos[o + 1], pos[o + 2]) || 1;
+      const x = pos[o] / r, y = pos[o + 1] / r, z = pos[o + 2] / r;
+      mx += x; my += y; mz += z;
+      xx += x * x; yy += y * y; zz += z * z;
+      xy += x * y; xz += x * z; yz += y * z;
+    }
+    mx /= count; my /= count; mz /= count;
+    xx = xx / count - 1 / 3; yy = yy / count - 1 / 3; zz = zz / count - 1 / 3;
+    xy /= count; xz /= count; yz /= count;
+
+    // 球壳：内外两面都是软墙，壳内不受约束，线条因此有了远近。
+    let maxMove = 0;
+    for (let i = 0; i < count; i++) {
+      const o = i * 3, x = pos[o], y = pos[o + 1], z = pos[o + 2];
+      const r = Math.sqrt(x * x + y * y + z * z);
+      let fx = force[o], fy = force[o + 1], fz = force[o + 2];
+      if (r > 1e-9) {
+        const ux = x / r, uy = y / r, uz = z / r;
+        const bx = C.SPREAD_K * mx + C.ISOTROPY_K * (xx * ux + xy * uy + xz * uz);
+        const by = C.SPREAD_K * my + C.ISOTROPY_K * (xy * ux + yy * uy + yz * uz);
+        const bz = C.SPREAD_K * mz + C.ISOTROPY_K * (xz * ux + yz * uy + zz * uz);
+        const radial = bx * ux + by * uy + bz * uz;
+        fx -= bx - radial * ux; fy -= by - radial * uy; fz -= bz - radial * uz;
+      }
+      const over = r > C.R_OUT ? C.R_OUT - r : r < C.R_IN ? C.R_IN - r : 0;
+      if (r > 1e-9) {
+        const k = (C.SHELL_K * over + C.MID_K * ((C.R_IN + C.R_OUT) / 2 - r)) / r;
+        fx += x * k; fy += y * k; fz += z * k;
+      }
+      let vx = (vel[o] + fx * C.STEP * heat) * C.DAMPING;
+      let vy = (vel[o + 1] + fy * C.STEP * heat) * C.DAMPING;
+      let vz = (vel[o + 2] + fz * C.STEP * heat) * C.DAMPING;
+      const v = Math.sqrt(vx * vx + vy * vy + vz * vz);
+      if (v > C.MAX_SPEED) { const k = C.MAX_SPEED / v; vx *= k; vy *= k; vz *= k; }
+      vel[o] = vx; vel[o + 1] = vy; vel[o + 2] = vz;
+      pos[o] = x + vx; pos[o + 1] = y + vy; pos[o + 2] = z + vz;
+      if (v > maxMove) maxMove = v;
+    }
+    heat *= C.COOLING;
+    quietSteps = maxMove < C.QUIET_SPEED ? quietSteps + 1 : 0;
+    if (heat < C.SLEEP_HEAT || quietSteps >= 45) { sleeping = true; vel.fill(0); }
+  }
+
+  return { pos, step, get sleeping() { return sleeping; }, get heat() { return heat; } };
+}
+
+// 作为 Worker 运行时：收到图结构后以每秒约 60 步推进，每步把坐标发回主线程；可随时暂停/继续。
+if (typeof WorkerGlobalScope !== "undefined" && self instanceof WorkerGlobalScope) {
+  let sim = null, paused = false, timer = 0;
+  const tick = () => {
+    timer = 0;
+    if (!sim || paused || sim.sleeping) return;
+    const t0 = performance.now();
+    sim.step();
+    const out = Float32Array.from(sim.pos);
+    self.postMessage({ pos: out, sleeping: sim.sleeping }, [out.buffer]);
+    if (!sim.sleeping) timer = setTimeout(tick, Math.max(0, 1000 / 60 - (performance.now() - t0)));
+  };
+  self.onmessage = e => {
+    const d = e.data;
+    if (d.edges) sim = createPhysics(d.count, d.edges, d.seed);
+    if (d.paused !== undefined) paused = d.paused;
+    if (!timer) tick();
+  };
+}
+</script>
+<script>
+"use strict";
+
+/* ============ 基础 ============ */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const exitFocusBtn = document.getElementById("exitFocusBtn");
+let W = window.innerWidth, H = window.innerHeight, DPR = 1;
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const BRUSH = '"STXingkai","华文行楷","HanziPen SC","STKaiti","KaiTi","楷体",serif';
+const READING = '"Songti SC","Noto Serif SC","Source Han Serif SC","STSong","SimSun","宋体",serif';
+
+/* ============ 数据模型 ============ */
+// 每首诗的结点序列为 [title, ...lines]，与 clusters.js 中的 node 字段一一对应。
+// 所有结点都是单位球面上的点 (x, y, z)，摄像机位于球心。
+const strands = POEMS.map((p, i) => {
+  const seq = [p.title, ...p.lines];
+  return {
+    poemIdx: i,
+    title: p.title,
+    texts: seq,
+    displayWidth: 0.65,
+    ink: 0, // 0 = 按深度浓淡，1 = 高亮的墨色；悬停/聚焦时平滑过渡
+    bold: 0, // 悬停结视图里的诗句时，整条诗线逐渐加粗
+    nodes: seq.map(() => ({ x: 0, y: 0, z: 1 }))
+  };
+});
+const poemByTitle = new Map(POEMS.map((p, i) => [p.title, i]));
+
+// 真正的"打结"：同一簇里的诗句结点直接共享同一个物理点对象——
+// 多条诗线在此收束到完全相同的坐标，物理上就是同一个结。
+const knots = CLUSTERS.map((c, ci) => {
+  const knotNode = { x: 0, y: 0, z: 1, isKnot: true, id: ci, title: c.title || "节点", entries: c.lines };
+  c.lines.forEach(e => {
+    const poemIdx = poemByTitle.get(e.poem);
+    strands[poemIdx].nodes[e.node] = knotNode;
+  });
+  knotNode.memberCount = c.lines.length;
+  return knotNode;
+});
+
+/* ============ 去重收集所有独立物理点（共享结点只算一个） ============ */
+const allPoints = [];
+{
+  const seen = new Set();
+  strands.forEach(s => s.nodes.forEach(n => {
+    if (!seen.has(n)) { seen.add(n); allPoints.push(n); }
+  }));
+}
+
+/* ============ 物理：交给 Web Worker 在后台推进，主线程只接收坐标 ============ */
+// 物理代码在上方 #physicsSource 中；Worker 不可用时退回主线程逐帧计算。
+const PHYSICS_SEED = 20240615;
+let layoutRevision = 0, layoutSleeping = false;
+const pointIndex = new Map(allPoints.map((p, i) => [p, i]));
+const edgeList = new Int32Array(strands.flatMap(s =>
+  s.nodes.slice(1).flatMap((n, i) => [pointIndex.get(s.nodes[i]), pointIndex.get(n)])));
+
+function applyPositions(pos) {
+  if (typeof reading !== "undefined" && (reading || readingReturn)) return;
+  allPoints.forEach((p, i) => { p.x = pos[i * 3]; p.y = pos[i * 3 + 1]; p.z = pos[i * 3 + 2]; });
+  layoutRevision++;
+}
+
+// 主线程先按同一随机种子生成初始线团，保证第一帧就有画面。
+let mainThreadSim = createPhysics(allPoints.length, edgeList, PHYSICS_SEED);
+applyPositions(mainThreadSim.pos);
+let physicsWorker = null, physicsPaused = false;
+try {
+  const url = URL.createObjectURL(new Blob([document.getElementById("physicsSource").textContent], { type: "text/javascript" }));
+  physicsWorker = new Worker(url);
+  physicsWorker.onmessage = e => {
+    applyPositions(e.data.pos);
+    layoutSleeping = e.data.sleeping;
+  };
+  physicsWorker.onerror = () => { physicsWorker.terminate(); physicsWorker = null; };
+  physicsWorker.postMessage({ count: allPoints.length, edges: edgeList, seed: PHYSICS_SEED });
+} catch (e) {
+  physicsWorker = null;
+}
+
+// 聚焦阅读时暂停布局，让框定的画面和诗句标签保持静止，便于阅读。
+function setPhysicsPaused(paused) {
+  if (paused === physicsPaused) return;
+  physicsPaused = paused;
+  if (physicsWorker) physicsWorker.postMessage({ paused });
+}
+
+/* ============ 摄像机：位于球心，只转动朝向（偏航/俯仰）与视野 ============ */
+const DEG = Math.PI / 180;
+const FOV_MIN = 15 * DEG, FOV_MAX = 70 * DEG, PITCH_LIMIT = 89 * DEG, NEAR_Z = 0.02;
+// 视野保持适中：针孔投影在大视野下边缘拉伸严重。
+const view = { yaw: 0, pitch: 0, fov: 55 * DEG };
+// A gentle, one-way turn pauses for interaction and resumes in the overview.
+const overviewDrift = { active: true, elapsed: 0, resumeAt: 0 };
+function stopOverviewDrift() { overviewDrift.active = false; }
+function resumeOverviewDrift(delay = 0) {
+  overviewDrift.active = true;
+  overviewDrift.elapsed = 0;
+  overviewDrift.resumeAt = performance.now() + delay;
+}
+function tickOverviewDrift(dt) {
+  if (!overviewDrift.active || dragging || camAnim || focusStrand >= 0 || lockedKnot >= 0 || readingReturn) return;
+  if (performance.now() < overviewDrift.resumeAt || spin.yaw || spin.pitch) return;
+  if (document.hidden) return;
+  dt = Math.min(dt, 1000);
+  overviewDrift.elapsed += dt;
+  const t = clamp(overviewDrift.elapsed / 1500, 0, 1);
+  const speed = t * t * (3 - 2 * t);
+  rotateView(0.45 * DEG * dt / 1000 * speed, 0);
+}
+const cam = {};
+const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
+const yawOf = d => Math.atan2(d[0], d[2]);
+const pitchOf = d => Math.asin(clamp(d[1], -1, 1));
+
+function setBasis(v, b = cam) {
+  const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw), cp = Math.cos(v.pitch), sp = Math.sin(v.pitch);
+  b.fx = cp * sy; b.fy = sp; b.fz = cp * cy;     // 视线方向
+  b.rx = cy; b.rz = -sy;                         // 屏幕向右（始终水平）
+  b.ux = -sp * sy; b.uy = cp; b.uz = -sp * cy;   // 屏幕向上
+  b.F = (H / 2) / Math.tan(v.fov / 2);
+  // 视锥裁剪：比屏幕对角线再宽约 3°，线段在屏幕外才被截断。
+  const halfDiag = Math.atan(Math.hypot(W, H) / 2 / b.F);
+  b.cull = Math.max(NEAR_Z, Math.cos(Math.min(halfDiag + 0.05, 88 * DEG)));
+  return b;
+}
+
+// 单点针孔投影；结果写入 PX/PY，视锥外的点返回 false。点可以在球壳内任意深度。
+let PX = 0, PY = 0;
+function project(x, y, z) {
+  const cz = x * cam.fx + y * cam.fy + z * cam.fz;
+  if (cz < cam.cull * Math.sqrt(x * x + y * y + z * z)) return false;
+  PX = W / 2 + cam.F * (x * cam.rx + z * cam.rz) / cz;
+  PY = H / 2 - cam.F * (x * cam.ux + y * cam.uy + z * cam.uz) / cz;
+  return true;
+}
+function unproject(sx, sy) {
+  const a = (sx - W / 2) / cam.F, c = -(sy - H / 2) / cam.F;
+  const x = cam.fx + a * cam.rx + c * cam.ux;
+  const y = cam.fy + c * cam.uy;
+  const z = cam.fz + a * cam.rz + c * cam.uz;
+  const len = Math.hypot(x, y, z);
+  return [x / len, y / len, z / len];
+}
+
+/* ============ 曲线采样（布局改变时才重算） ============ */
+// Catmull-Rom 插值只决定方向，半径在相邻结点间线性过渡：曲线严格穿过每个结点，
+// 并始终贴着球壳走，被拉长的弦也不会横穿球心附近。按从球心看去的张角细分，每段约 0.7°。
+const SAMPLE_STEP = 0.012; // 弧度
+let sampleRevision = -1;
+
+function sampleStrand(pts) {
+  const out = [pts[0].x, pts[0].y, pts[0].z];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    const c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6, c1z = p1.z + (p2.z - p0.z) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6, c2z = p2.z - (p3.z - p1.z) / 6;
+    const r1 = Math.hypot(p1.x, p1.y, p1.z), r2 = Math.hypot(p2.x, p2.y, p2.z);
+    const cos = (p1.x * p2.x + p1.y * p2.y + p1.z * p2.z) / (r1 * r2 || 1);
+    const steps = clamp(Math.ceil(Math.acos(clamp(cos, -1, 1)) / SAMPLE_STEP), 1, 16);
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps, u = 1 - t;
+      const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+      const x = a * p1.x + b * c1x + c * c2x + d * p2.x;
+      const y = a * p1.y + b * c1y + c * c2y + d * p2.y;
+      const z = a * p1.z + b * c1z + c * c2z + d * p2.z;
+      const k2 = (r1 + (r2 - r1) * t) / (Math.hypot(x, y, z) || 1);
+      out.push(x * k2, y * k2, z * k2);
+    }
+  }
+  return new Float32Array(out);
+}
+
+function updateSamples() {
+  if (sampleRevision === layoutRevision) return;
+  for (const s of strands) {
+    s.samples = sampleStrand(reading && s.poemIdx === reading.si ? reading.nodes : s.nodes);
+    const n = s.samples.length / 3;
+    if (!s.scr || s.scr.length !== n * 2) { s.scr = new Float32Array(n * 2); s.depth = new Uint8Array(n); }
+  }
+  sampleRevision = layoutRevision;
+}
+
+/* ============ 批量投影：视角或布局变化时一次算完，绘制与命中检测共用 ============ */
+// 球壳有厚度：按到球心（即摄像机）的距离分成几层，近处的线更粗更深，远处更细更淡。
+// 分层足够细，相邻层之间的粗细与浓淡差异肉眼几乎察觉不到，整体呈连续渐变。
+const DEPTH_LAYERS = 16;
+const depthRamp = (near, far) => Array.from({ length: DEPTH_LAYERS }, (_, i) => lerp(near, far, i / (DEPTH_LAYERS - 1)));
+const DEPTH_WIDTH = depthRamp(0.95, 0.42);
+const DEPTH_DARKNESS = depthRamp(0.9, 0.3);
+const DEPTH_KNOT = depthRamp(1.15, 0.7);
+const depthLayer = r => clamp(Math.floor((r - PHYSICS.R_IN) / (PHYSICS.R_OUT - PHYSICS.R_IN) * DEPTH_LAYERS), 0, DEPTH_LAYERS - 1);
+
+function projectLine(line) {
+  const a = line.samples, o = line.scr, dep = line.depth;
+  const { fx, fy, fz, rx, rz, ux, uy, uz, F, cull } = cam;
+  const hw = W / 2, hh = H / 2;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, prev = false, drawn = false;
+  for (let i = 0, j = 0; i < a.length; i += 3, j += 2) {
+    const x = a[i], y = a[i + 1], z = a[i + 2];
+    const cz = x * fx + y * fy + z * fz, r = Math.sqrt(x * x + y * y + z * z);
+    if (cz < cull * r) { o[j] = NaN; prev = false; continue; }
+    const sx = hw + F * (x * rx + z * rz) / cz, sy = hh - F * (x * ux + y * uy + z * uz) / cz;
+    o[j] = sx; o[j + 1] = sy; dep[j >> 1] = depthLayer(r);
+    if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
+    if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
+    if (prev) drawn = true;
+    prev = true;
+  }
+  line.minX = minX; line.minY = minY; line.maxX = maxX; line.maxY = maxY;
+  line.onScreen = drawn && maxX >= 0 && minX <= W && maxY >= 0 && minY <= H;
+}
+
+// 把线段按起点所在深度层分别追加到各层路径里，同层相邻线段连成一笔。
+function traceDepthLayers(paths, o, dep) {
+  let last = -1;
+  for (let j = 2; j < o.length; j += 2) {
+    const ax = o[j - 2], bx = o[j];
+    if (ax !== ax || bx !== bx) { last = -1; continue; }
+    const layer = dep[(j >> 1) - 1], path = paths[layer];
+    if (layer !== last) path.moveTo(ax, o[j - 1]);
+    path.lineTo(bx, o[j + 1]);
+    last = layer;
+  }
+}
+
+let projectedKey = "";
+function projectScene() {
+  const key = `${view.yaw},${view.pitch},${view.fov},${W},${H},${layoutRevision}`;
+  if (key === projectedKey) return false;
+  projectedKey = key;
+  for (const s of strands) projectLine(s);
+  for (const k of knots) {
+    k.onScreen = project(k.x, k.y, k.z) && PX > -20 && PX < W + 20 && PY > -20 && PY < H + 20;
+    k.sx = PX; k.sy = PY;
+    k.layer = depthLayer(Math.hypot(k.x, k.y, k.z));
+  }
+  return true;
+}
+
+/* ============ 视角平滑过渡（点击聚焦时的"优雅入框"） ============ */
+let camAnim = null;
+const spin = { yaw: 0, pitch: 0 }; // 松手后的角速度（弧度/毫秒）
+function tweenViewTo(target, dur = 900) {
+  const to = { yaw: view.yaw + wrapAngle(target.yaw - view.yaw), pitch: target.pitch, fov: target.fov };
+  camAnim = { from: { ...view }, to, t0: performance.now(), dur };
+  spin.yaw = 0; spin.pitch = 0;
+}
+function applyCameraAnim() {
+  if (!camAnim) return;
+  const t = clamp((performance.now() - camAnim.t0) / camAnim.dur, 0, 1);
+  const e = easeInOut(t);
+  view.yaw = lerp(camAnim.from.yaw, camAnim.to.yaw, e);
+  view.pitch = lerp(camAnim.from.pitch, camAnim.to.pitch, e);
+  view.fov = lerp(camAnim.from.fov, camAnim.to.fov, e);
+  if (t >= 1) camAnim = null;
+}
+
+/* ============ 聚焦阅读：把整根诗线转到正前方并框入画面 ============ */
+let focusStrand = -1;
+let savedView = null;
+
+function computeFitView(si) {
+  const arr = strands[si].samples;
+  let ax = 0, ay = 0, az = 0;
+  for (let i = 0; i < arr.length; i += 3) {
+    const r = Math.hypot(arr[i], arr[i + 1], arr[i + 2]) || 1;
+    ax += arr[i] / r; ay += arr[i + 1] / r; az += arr[i + 2] / r;
+  }
+  const len = Math.hypot(ax, ay, az) || 1;
+  const d = [ax / len, ay / len, az / len];
+  const target = { yaw: yawOf(d), pitch: clamp(pitchOf(d), -PITCH_LIMIT, PITCH_LIMIT), fov: FOV_MAX };
+  // 以单位焦距求各点在屏幕平面上的最大偏移，再反推能完整容纳的视野。
+  const b = setBasis(target, {});
+  let maxX = 0, maxY = 0;
+  for (let i = 0; i < arr.length; i += 3) {
+    const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+    const cz = x * b.fx + y * b.fy + z * b.fz;
+    if (cz < NEAR_Z * Math.hypot(x, y, z)) { maxX = maxY = Infinity; break; }
+    maxX = Math.max(maxX, Math.abs(x * b.rx + z * b.rz) / cz);
+    maxY = Math.max(maxY, Math.abs(x * b.ux + y * b.uy + z * b.uz) / cz);
+  }
+  // 两侧留出诗句文字的宽度，上方留出文字高度。
+  const F = Math.min(Math.max(W / 2 - 160, W / 4) / (maxX || 1e-6), Math.max(H / 2 - 60, H / 4) / (maxY || 1e-6));
+  target.fov = clamp(2 * Math.atan((H / 2) / F), FOV_MIN, FOV_MAX);
+  return target;
+}
+
+/* ============ 结的局部视图：结偏在一侧，另一侧留白写出交汇的诗句 ============ */
+let knotLayout = null;     // { ki, view, kx, ky, textX, textY }
+let knotTextLevel = 0;     // 诗句文字的淡入程度
+let knotTextHover = -1;    // 悬停中的诗句条目（下标），与对应诗线双向联动
+const knotEntryStrand = i => poemByTitle.get(knots[lockedKnot].entries[i].poem);
+
+function computeKnotView(ki) {
+  const k = knots[ki], kr = Math.hypot(k.x, k.y, k.z) || 1;
+  const d = [k.x / kr, k.y / kr, k.z / kr];
+  // 视野：容纳每条相关诗线在结前后各一句的范围，并且一定比原视野明显拉近。
+  let maxA = 0.05;
+  for (const si of k.strands) {
+    const ns = strands[si].nodes, i = ns.indexOf(k);
+    for (let j = Math.max(0, i - 1); j <= Math.min(ns.length - 1, i + 1); j++) {
+      const n = ns[j], r = Math.hypot(n.x, n.y, n.z) || 1;
+      maxA = Math.max(maxA, Math.acos(clamp((n.x * d[0] + n.y * d[1] + n.z * d[2]) / r, -1, 1)));
+    }
+  }
+  const room = Math.max(H / 2 - 90, H / 4);
+  const zoomCap = Math.min(32 * DEG, (savedView || view).fov * 0.6);
+  const fov = clamp(2 * Math.atan(Math.tan(Math.min(maxA, 1.2)) * (H / 2) / room), FOV_MIN, zoomCap);
+  const v = { yaw: yawOf(d), pitch: clamp(pitchOf(d), -PITCH_LIMIT, PITCH_LIMIT), fov };
+
+  // 以结为中心看一眼：相关诗线更多地伸向哪一侧，文字就写在另一侧。
+  let b = setBasis(v, {}), left = 0, right = 0;
+  for (const si of k.strands) {
+    const arr = strands[si].samples;
+    for (let i = 0; i < arr.length; i += 3) {
+      const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+      const cz = x * b.fx + y * b.fy + z * b.fz;
+      if (cz < b.cull * Math.hypot(x, y, z)) continue;
+      const sx = b.F * (x * b.rx + z * b.rz) / cz, sy = b.F * (x * b.ux + y * b.uy + z * b.uz) / cz;
+      if (Math.abs(sx) > W / 2 || Math.abs(sy) > H / 2) continue;
+      if (sx < 0) left++; else right++;
+    }
+  }
+  const textOnRight = right <= left;
+  const kx = textOnRight ? W * 0.34 : W * 0.66, ky = H / 2;
+
+  // 迭代微调朝向，使结恰好落在 (kx, ky)。
+  for (let it = 0; it < 12; it++) {
+    b = setBasis(v, b);
+    const cz = d[0] * b.fx + d[1] * b.fy + d[2] * b.fz;
+    if (cz <= 0) break;
+    const px = W / 2 + b.F * (d[0] * b.rx + d[2] * b.rz) / cz;
+    const py = H / 2 - b.F * (d[0] * b.ux + d[1] * b.uy + d[2] * b.uz) / cz;
+    v.yaw += (px - kx) / b.F / Math.max(Math.cos(v.pitch), 0.2);
+    v.pitch = clamp(v.pitch - (py - ky) / b.F, -PITCH_LIMIT, PITCH_LIMIT);
+  }
+  return { ki, view: v, kx, ky, lit: new Float32Array(k.entries.length), rects: [], ...placeKnotText(k, setBasis(v, b), kx, ky) };
+}
+
+// 在目标视角下把所有诗线投到 10px 网格上（相关诗线权重 1，已变淡的其余诗线 0.15），
+// 用积分图快速比较候选位置，选一个线最少、离结不远、又不压住结的地方写字。
+const KNOT_TEXT = { TITLE: 14, VERSE: 20, LINE_GAP: 8, GAP: 26 };
+const knotTitle = e => `《${e.poem}》`;
+function knotTextSize(k) {
+  let w = 0;
+  ctx.font = `${KNOT_TEXT.TITLE}px ${READING}`;
+  for (const e of k.entries) w = Math.max(w, ctx.measureText(knotTitle(e)).width);
+  ctx.font = `${KNOT_TEXT.VERSE}px ${READING}`;
+  for (const e of k.entries) w = Math.max(w, ctx.measureText(e.text).width);
+  const n = k.entries.length;
+  return { w: Math.min(w, W - 80), h: n * (KNOT_TEXT.TITLE + KNOT_TEXT.LINE_GAP + KNOT_TEXT.VERSE) + (n - 1) * KNOT_TEXT.GAP };
+}
+function placeKnotText(k, b, kx, ky) {
+  const { w, h } = knotTextSize(k);
+  const CELL = 10, gw = Math.ceil(W / CELL), gh = Math.ceil(H / CELL);
+  const sat = new Float32Array((gw + 1) * (gh + 1));
+  strands.forEach((s, si) => {
+    const weight = k.strands.has(si) ? 1 : 0.15, arr = s.samples;
+    for (let i = 0; i < arr.length; i += 3) {
+      const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+      const cz = x * b.fx + y * b.fy + z * b.fz;
+      if (cz < b.cull * Math.hypot(x, y, z)) continue;
+      const cx = Math.floor((W / 2 + b.F * (x * b.rx + z * b.rz) / cz) / CELL);
+      const cy = Math.floor((H / 2 - b.F * (x * b.ux + y * b.uy + z * b.uz) / cz) / CELL);
+      if (cx >= 0 && cx < gw && cy >= 0 && cy < gh) sat[(cy + 1) * (gw + 1) + cx + 1] += weight;
+    }
+  });
+  for (let y = 1; y <= gh; y++) for (let x = 1; x <= gw; x++) {
+    const i = y * (gw + 1) + x;
+    sat[i] += sat[i - 1] + sat[i - gw - 1] - sat[i - gw - 2];
+  }
+  const boxSum = (x0, y0, x1, y1) => {
+    const a = clamp(Math.floor(x0 / CELL), 0, gw), c = clamp(Math.ceil(x1 / CELL), 0, gw);
+    const bb = clamp(Math.floor(y0 / CELL), 0, gh), d = clamp(Math.ceil(y1 / CELL), 0, gh);
+    return sat[d * (gw + 1) + c] - sat[bb * (gw + 1) + c] - sat[d * (gw + 1) + a] + sat[bb * (gw + 1) + a];
+  };
+  // 文字只在屏幕中部约 70% 的范围里找位置，并额外偏向屏幕中心，不贴边。
+  const PAD = 16, KNOT_CLEAR = 60, TOP = 90;
+  const xMin = Math.min(W * 0.15, (W - w) / 2), xMax = Math.max(W * 0.85 - w, xMin);
+  const yMin = Math.min(Math.max(TOP, H * 0.15), (H - h) / 2), yMax = Math.max(H * 0.85 - h, yMin);
+  let best = null;
+  for (let y = yMin; y <= yMax; y += 20) {
+    for (let x = xMin; x <= xMax; x += 20) {
+      // 不压住结本身
+      const nx = clamp(kx, x - KNOT_CLEAR, x + w + KNOT_CLEAR), ny = clamp(ky, y - KNOT_CLEAR, y + h + KNOT_CLEAR);
+      if (kx === nx && ky === ny) continue;
+      const dist = Math.hypot(x + w / 2 - kx, y + h / 2 - ky);
+      const offCenter = Math.hypot(x + w / 2 - W / 2, y + h / 2 - H / 2);
+      const cost = boxSum(x - PAD, y - PAD, x + w + PAD, y + h + PAD) + dist / 40 + offCenter / 30;
+      if (!best || cost < best.cost) best = { cost, textX: x, textY: y };
+    }
+  }
+  return best || { textX: xMin, textY: yMin };
+}
+
+function enterKnotView(ki) {
+  stopOverviewDrift();
+  if (reading) { transitionReadingToKnot(ki); return; }
+  if (!savedView) savedView = { ...view };
+  focusStrand = -1;
+  lockedKnot = ki;
+  knotLayout = computeKnotView(ki);
+  tweenViewTo(knotLayout.view);
+}
+function enterFocus(si) {
+  stopOverviewDrift();
+  beginStraightReading(si);
+}
+function exitToOverview() {
+  const returningToOverview = focusStrand >= 0 || lockedKnot >= 0 || !!reading || !!readingReturn;
+  stopStraightReading();
+  knotTextHover = -1;
+  focusStrand = -1;
+  lockedKnot = -1;
+  if (savedView) { tweenViewTo(savedView); savedView = null; }
+  if (returningToOverview) resumeOverviewDrift();
+  needsRedraw = true;
+}
+
+/* ============ 交互：拖拽环视（带惯性）/滚轮缩放视野/悬停/抚摸 ============ */
+let dragging = false, lastDrag = null;
+let pressStart = null, pressMoved = false, suppressClick = false;
+let hoverStrand = -1, hoverKnot = -1, lockedKnot = -1;
+let mouseScreen = { x: -1000, y: -1000 };
+let needsRedraw = true, pickDirty = true;
+
+function rotateView(dYaw, dPitch) {
+  view.yaw = wrapAngle(view.yaw + dYaw);
+  view.pitch = clamp(view.pitch + dPitch, -PITCH_LIMIT, PITCH_LIMIT);
+}
+
+function startPan(x, y) {
+  stopOverviewDrift();
+  pressStart = { x, y };
+  pressMoved = false;
+  suppressClick = false;
+  if (reading) reading.touchY = y;
+  spin.yaw = 0; spin.pitch = 0;
+  if (focusStrand >= 0) return; // 聚焦阅读时不转动，留给"抚摸"读诗
+  camAnim = null;
+  dragging = true; canvas.classList.add("dragging");
+  lastDrag = { x, y, t: performance.now() };
+  needsRedraw = true;
+}
+function movePan(x, y) {
+  mouseScreen.x = x; mouseScreen.y = y;
+  pickDirty = true; needsRedraw = true;
+  if (pressStart && Math.hypot(x - pressStart.x, y - pressStart.y) > 6) {
+    pressMoved = true;
+  }
+  if (reading && pressStart && reading.touchY !== undefined) {
+    scrollReading(reading.touchY - y);
+    reading.touchY = y;
+  }
+  if (dragging) {
+    // 像拖动星空一样"抓住"天球：向右拖，天空随之右移，视线左转。
+    const now = performance.now();
+    const dYaw = -(x - lastDrag.x) / cam.F, dPitch = (y - lastDrag.y) / cam.F;
+    rotateView(dYaw, dPitch);
+    const dt = now - lastDrag.t;
+    if (dt > 0) {
+      spin.yaw = lerp(spin.yaw, dYaw / dt, 0.6);
+      spin.pitch = lerp(spin.pitch, dPitch / dt, 0.6);
+    }
+    lastDrag = { x, y, t: now };
+  }
+}
+function endPan(x, y) {
+  const wasPanning = dragging;
+  if (pressStart && x !== undefined && Math.hypot(x - pressStart.x, y - pressStart.y) > 6) {
+    pressMoved = true;
+  }
+  suppressClick = pressMoved;
+  pressStart = null;
+  if (dragging && performance.now() - lastDrag.t > 80) { spin.yaw = 0; spin.pitch = 0; }
+  if (dragging) { pickDirty = true; needsRedraw = true; }
+  dragging = false;
+  canvas.classList.remove("dragging");
+  if (wasPanning && focusStrand < 0 && lockedKnot < 0 && !readingReturn) resumeOverviewDrift(1000);
+}
+
+canvas.addEventListener("mousedown", e => startPan(e.clientX, e.clientY));
+canvas.addEventListener("mouseleave", () => {
+  mouseScreen = { x: -1000, y: -1000 };
+  hoverStrand = -1;
+  hoverKnot = -1;
+  needsRedraw = true;
+});
+window.addEventListener("mouseup", e => endPan(e.clientX, e.clientY));
+window.addEventListener("mousemove", e => movePan(e.clientX, e.clientY));
+
+canvas.addEventListener("touchstart", e => {
+  if (e.touches.length !== 1) return;
+  const t = e.touches[0];
+  mouseScreen.x = t.clientX; mouseScreen.y = t.clientY;
+  startPan(t.clientX, t.clientY);
+}, { passive: true });
+canvas.addEventListener("touchmove", e => {
+  if (e.touches.length !== 1) return;
+  const t = e.touches[0];
+  movePan(t.clientX, t.clientY);
+  e.preventDefault();
+}, { passive: false });
+window.addEventListener("touchend", e => {
+  const t = e.changedTouches[0];
+  endPan(t?.clientX, t?.clientY);
+});
+
+// 缩放即改变视野角；同时微调朝向，让光标下的那片天空保持不动。
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  stopOverviewDrift();
+  if (reading) {
+    scrollReading(e.deltaY * (e.deltaMode === 1 ? 20 : e.deltaMode === 2 ? H : 1));
+    return;
+  }
+  if (readingReturn) return;
+  camAnim = null;
+  const before = unproject(e.clientX, e.clientY);
+  view.fov = clamp(view.fov * Math.exp(e.deltaY * 0.0012), FOV_MIN, FOV_MAX);
+  setBasis(view);
+  const after = unproject(e.clientX, e.clientY);
+  rotateView(wrapAngle(yawOf(before) - yawOf(after)), pitchOf(before) - pitchOf(after));
+  setBasis(view);
+  if (focusStrand < 0 && lockedKnot < 0) resumeOverviewDrift(1500);
+}, { passive: false });
+
+canvas.addEventListener("click", e => {
+  if (suppressClick) { suppressClick = false; return; }
+  if (readingReturn) return;
+  mouseScreen = { x: e.clientX, y: e.clientY };
+  pickHover();
+  if (reading) {
+    if (hoverKnot >= 0) enterKnotView(hoverKnot);
+    else if (hoverStrand >= 0 && readingAllowedStrands().has(hoverStrand)) enterFocus(hoverStrand);
+    return;
+  }
+  if (knotTextHover >= 0 && lockedKnot >= 0) {
+    enterFocus(knotEntryStrand(knotTextHover)); // 点击诗句：跳到整首诗的阅读视图
+  } else if (hoverKnot >= 0) {
+    if (lockedKnot === hoverKnot) exitToOverview();
+    else enterKnotView(hoverKnot);
+  } else if (hoverStrand >= 0) {
+    if (focusStrand === hoverStrand) exitToOverview();
+    else enterFocus(hoverStrand);
+  } else if (focusStrand >= 0 || lockedKnot >= 0) {
+    exitToOverview();
+  }
+  needsRedraw = true;
+});
+
+exitFocusBtn.addEventListener("click", exitToOverview);
+window.addEventListener("keydown", e => {
+  if (e.code === "Escape") exitToOverview();
+  else if (reading && ["ArrowDown", "ArrowUp", "Space", "PageDown", "PageUp"].includes(e.code)) {
+    e.preventDefault();
+    scrollReading(e.code === "ArrowUp" ? -80 : e.code === "PageUp" ? -H * .7 : e.code === "ArrowDown" ? 80 : H * .7);
+  }
+});
+
+/* ============ 命中检测（屏幕坐标，直接算点到折线段的距离） ============ */
+const LINE_HIT_R = 16; // 屏幕像素：曲线两侧各 16px。
+const LINE_HOLD_R = 28; // 当前悬停线优先保留焦点，直到鼠标离开更宽的范围。
+const KNOT_HIT_R = 10;
+const HOVER_DELAY_MS = 3000;
+const hoverReadyAt = performance.now() + HOVER_DELAY_MS;
+let hoverArmed = false;
+
+// 诗线停留一秒后显题；离开后立即淡出。切换标题时先淡出再淡入。
+const TITLE_HOVER_DELAY_MS = 1000, TITLE_FADE_MS = 600;
+let titleHoverKey = "", titleHoverStartedAt = 0;
+let titleText = "", titleAlpha = 0, titleTween = null;
+let titlePosition = { x: 0, y: 0 };
+function fadeTitleTo(alpha, now) {
+  if (titleTween?.to === alpha || (!titleTween && titleAlpha === alpha)) return;
+  titleTween = { from: titleAlpha, to: alpha, start: now };
+}
+function updateTitleHover(now) {
+  if (titleTween) {
+    const t = clamp((now - titleTween.start) / TITLE_FADE_MS, 0, 1);
+    titleAlpha = lerp(titleTween.from, titleTween.to, t * t * (3 - 2 * t));
+    needsRedraw = true;
+    if (t === 1) titleTween = null;
+  }
+  const enabled = !dragging && lockedKnot < 0 && !readingReturn;
+  const key = !enabled ? "" : hoverKnot >= 0 ? `knot:${hoverKnot}` : hoverStrand >= 0 ? `strand:${hoverStrand}` : "";
+  if (key !== titleHoverKey) {
+    // 离开原目标（包括直接切到另一条诗线）时，立即淡出旧标题。
+    fadeTitleTo(0, now);
+    titleHoverKey = key;
+    titleHoverStartedAt = now;
+  }
+  // 光标离开画布时保留最后的有效位置，避免延迟消失的文字跳到边角。
+  if (mouseScreen.x >= 0 && mouseScreen.x <= W && mouseScreen.y >= 0 && mouseScreen.y <= H) {
+    titlePosition = { ...mouseScreen };
+  }
+  if (!key) {
+    fadeTitleTo(0, now);
+    return;
+  }
+  const isKnot = hoverKnot >= 0;
+  if (!isKnot && now - titleHoverStartedAt < TITLE_HOVER_DELAY_MS) return;
+  const nextText = isKnot ? knots[hoverKnot].title : strands[hoverStrand].title;
+  if (nextText !== titleText) {
+    if (titleAlpha > 0) { fadeTitleTo(0, now); return; }
+    titleText = nextText;
+    needsRedraw = true;
+  }
+  fadeTitleTo(1, now);
+}
+
+function distanceToLine(line, mx, my, limit) {
+  if (!line.onScreen || mx < line.minX - limit || mx > line.maxX + limit ||
+      my < line.minY - limit || my > line.maxY + limit) return Infinity;
+  const o = line.scr;
+  let best = limit * limit;
+  for (let j = 2; j < o.length; j += 2) {
+    const ax = o[j - 2], bx = o[j];
+    if (ax !== ax || bx !== bx) continue;
+    const ay = o[j - 1], by = o[j + 1];
+    const dx = bx - ax, dy = by - ay;
+    const l2 = dx * dx + dy * dy;
+    const t = l2 > 0 ? clamp(((mx - ax) * dx + (my - ay) * dy) / l2, 0, 1) : 0;
+    const ex = ax + dx * t - mx, ey = ay + dy * t - my;
+    const d2 = ex * ex + ey * ey;
+    if (d2 < best) best = d2;
+  }
+  return best < limit * limit ? Math.sqrt(best) : Infinity;
+}
+
+function pickHover() {
+  if (reading) {
+    let best = Infinity, hit = -1;
+    for (const si of readingAllowedStrands()) {
+      const d = distanceToLine(strands[si], mouseScreen.x, mouseScreen.y, LINE_HIT_R);
+      if (d < best) { best = d; hit = si; }
+    }
+    const knotHit = strands[reading.si].nodes.find(n => n.isKnot && n.onScreen &&
+      Math.hypot(mouseScreen.x - n.sx, mouseScreen.y - n.sy) < KNOT_HIT_R);
+    const ki = knotHit ? knotHit.id : -1;
+    if (ki >= 0) hit = -1;
+    if (hoverStrand !== hit || hoverKnot !== ki) needsRedraw = true;
+    hoverStrand = hit; hoverKnot = ki; knotTextHover = -1;
+    canvas.style.cursor = hit >= 0 || ki >= 0 ? "pointer" : "default";
+    return;
+  }
+  if (readingReturn) { hoverStrand = hoverKnot = -1; return; }
+  const prevStrand = hoverStrand, prevKnot = hoverKnot;
+  const mx = mouseScreen.x, my = mouseScreen.y;
+  const prevText = knotTextHover;
+  knotTextHover = -1;
+  if (performance.now() < hoverReadyAt || mx < 0 || my < 0 || mx > W || my > H) {
+    hoverStrand = -1; hoverKnot = -1;
+  } else if (!dragging && lockedKnot >= 0 && knotTextLevel > 0.5 &&
+      (knotTextHover = knotLayout.rects.findIndex(r => mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h)) >= 0) {
+    // 悬停在诗句上：由文字激活对应诗线（在主循环里处理）。
+    hoverStrand = -1; hoverKnot = -1;
+  } else if (!dragging) {
+    // 结的局部视图里，只有穿过这个结的诗线（和结本身）可以被悬停激活。
+    const onlyStrands = lockedKnot >= 0 ? knots[lockedKnot].strands : null;
+    let bestKnotD = KNOT_HIT_R, bestKnot = -1;
+    knots.forEach((k, i) => {
+      if (!k.onScreen || (lockedKnot >= 0 && i !== lockedKnot)) return;
+      const d = Math.hypot(mx - k.sx, my - k.sy);
+      if (d < bestKnotD) { bestKnotD = d; bestKnot = i; }
+    });
+    hoverKnot = bestKnot;
+    if (onlyStrands && !onlyStrands.has(hoverStrand)) hoverStrand = -1;
+    if (hoverKnot >= 0) hoverStrand = -1;
+    else if (hoverStrand < 0 || distanceToLine(strands[hoverStrand], mx, my, LINE_HOLD_R) === Infinity) {
+      // 多条曲线落入识别区时，选择距离鼠标最近的一条。
+      let bestD = Infinity, bestStrand = -1;
+      strands.forEach((s, si) => {
+        if (onlyStrands && !onlyStrands.has(si)) return;
+        const d = distanceToLine(s, mx, my, LINE_HIT_R);
+        if (d < bestD) { bestD = d; bestStrand = si; }
+      });
+      hoverStrand = bestStrand;
+    }
+  }
+  if (hoverStrand !== prevStrand || hoverKnot !== prevKnot || knotTextHover !== prevText) needsRedraw = true;
+  canvas.style.cursor = knotTextHover >= 0 ? "pointer" : "";
+}
+
+/* ============ 绘制 ============ */
+const PHYSICS_INTERVAL = 1000 / 60;
+let physicsElapsed = PHYSICS_INTERVAL;
+const EMPHASIS_R = 120;
+
+function nearestNodeOnStrand(si) {
+  let best = -1, bestD = 170;
+  strands[si].nodes.forEach((n, i) => {
+    if (!project(n.x, n.y, n.z)) return;
+    const d = Math.hypot(mouseScreen.x - PX, mouseScreen.y - PY);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
+function drawFocusPoem(si) {
+  drawStraightPoem();
+}
+
+// 结的局部视图：在留白一侧直接写出在此交汇的诗句（诗题 + 该句）。
+function drawKnotText() {
+  if (knotTextLevel < 0.01 || !knotLayout) return;
+  const k = knots[knotLayout.ki], a = knotTextLevel;
+  const { TITLE, VERSE, LINE_GAP, GAP } = KNOT_TEXT;
+  const x0 = knotLayout.textX, maxW = W - 40 - x0;
+  let y = knotLayout.textY;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.lineJoin = "round";
+  // 默认纯黑；激活时沿字形描一圈逐渐变宽的同色边，效果等同于字重连续加粗。
+  // （系统中文字体大多只有常规/粗体两档，font-weight 无法平滑过渡。）
+  const ink = `rgba(0,0,0,${a})`;
+  const writeText = (text, px, py, embolden) => {
+    ctx.fillText(text, px, py, maxW);
+    if (embolden > 0.02) { ctx.lineWidth = embolden; ctx.strokeText(text, px, py, maxW); }
+  };
+  ctx.fillStyle = ink;
+  ctx.strokeStyle = ink;
+  knotLayout.rects = k.entries.map((e, i) => {
+    const lit = knotLayout.lit[i], top = y;
+    ctx.font = `${TITLE}px ${READING}`;
+    writeText(knotTitle(e), x0, y, lit * 0.8);
+    const tw = ctx.measureText(knotTitle(e)).width;
+    y += TITLE + LINE_GAP;
+    ctx.font = `${VERSE}px ${READING}`;
+    writeText(e.text, x0, y, lit * 1.1);
+    const vw = ctx.measureText(e.text).width;
+    y += VERSE + GAP;
+    // 命中区域：整条（诗题 + 诗句），四周留一点余量
+    return { x: x0 - 8, y: top - 6, w: Math.min(Math.max(tw, vw), maxW) + 16, h: TITLE + LINE_GAP + VERSE + 12 };
+  });
+}
+
+// 光标附近的加粗段合并成实色填充路径，接点不再累计透明度。
+function drawEmphasis(s, baseWidth, extraWidth) {
+  const e = s.emphasisDir;
+  if (!e || !project(e[0], e[1], e[2])) return;
+  const ex = PX, ey = PY, o = s.scr, dep = s.depth;
+  const paths = Array.from({ length: DEPTH_LAYERS }, () => new Path2D());
+  const radius = (x, y) => {
+    const p = clamp(1 - Math.hypot(x - ex, y - ey) / EMPHASIS_R, 0, 1);
+    return (baseWidth + extraWidth * p * p * (3 - 2 * p)) / 2;
+  };
+  for (let j = 2; j < o.length; j += 2) {
+    const ax = o[j - 2], bx = o[j];
+    if (ax !== ax || bx !== bx) continue;
+    const ay = o[j - 1], by = o[j + 1];
+    if (Math.hypot((ax + bx) / 2 - ex, (ay + by) / 2 - ey) > EMPHASIS_R + 30) continue;
+    const dx = bx - ax, dy = by - ay, length = Math.hypot(dx, dy);
+    if (length < 1e-6) continue;
+    const nx = -dy / length, ny = dx / length;
+    const ra = radius(ax, ay), rb = radius(bx, by);
+    const path = paths[dep[(j >> 1) - 1]];
+    path.moveTo(ax + nx * ra, ay + ny * ra);
+    path.lineTo(ax - nx * ra, ay - ny * ra);
+    path.lineTo(bx - nx * rb, by - ny * rb);
+    path.lineTo(bx + nx * rb, by + ny * rb);
+    path.closePath();
+    path.moveTo(ax + ra, ay); path.arc(ax, ay, ra, 0, Math.PI * 2);
+    path.moveTo(bx + rb, by); path.arc(bx, by, rb, 0, Math.PI * 2);
+  }
+  for (let i = DEPTH_LAYERS - 1; i >= 0; i--) {
+    ctx.fillStyle = inkStyle(i, s.ink);
+    ctx.fill(paths[i]);
+  }
+}
+
+// 将深浅直接转换为实色灰阶；交叉、接点和加粗覆盖不再叠加透明度。
+const INK_DARKNESS = 0.95, INK_WIDTH = 1, DIM_FACTOR = 0.13;
+const TEXT_BOLD_EXTRA = 1.4; // 由诗句激活时整条线额外加粗的像素
+let dimLevel = 0; // 0 = 正常，1 = 聚焦/锁定结时其余线条压暗，同样平滑过渡
+const restDarkness = layer => DEPTH_DARKNESS[layer] * lerp(1, DIM_FACTOR, dimLevel);
+const toneColor = darkness => {
+  const d = clamp(darkness, 0, 1);
+  return `rgb(${[216, 220, 226].map(bg => Math.round(lerp(bg, 32, d))).join(',')})`;
+};
+const HOVER_WIDTH = 3.5;
+const inkStyle = (layer, ink) => toneColor(lerp(restDarkness(layer), INK_DARKNESS, ink));
+
+function draw() {
+  document.getElementById("readingAuthor").hidden = true;
+  ctx.save();
+  ctx.scale(DPR, DPR);
+  ctx.clearRect(0, 0, W, H);
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  // 普通曲线合并为一条路径一次描完；只有带墨色或正在过渡粗细的曲线单独绘制。
+  // 每个深度层各一条路径，整张网只需 DEPTH_LAYERS 次描边。
+  const layers = Array.from({ length: DEPTH_LAYERS }, () => new Path2D()), special = [];
+  strands.forEach(s => {
+    if (!s.onScreen) return;
+    if (s.ink > 0.002 || s.bold > 0.002 || s.displayWidth > 0.66) special.push(s);
+    else traceDepthLayers(layers, s.scr, s.depth);
+  });
+  for (let i = DEPTH_LAYERS - 1; i >= 0; i--) {
+    ctx.strokeStyle = inkStyle(i, 0);
+    ctx.lineWidth = DEPTH_WIDTH[i];
+    ctx.stroke(layers[i]);
+  }
+  // 背景先画，关联诗线其次，当前诗线最后，浅色线不会盖住深色线。
+  const tier = s => !reading ? 0 : s.poemIdx === reading.si ? 2 : reading.related.has(s.poemIdx) ? 1 : 0;
+  special.sort((a, b) => tier(a) - tier(b) || a.ink - b.ink);
+
+  // 高亮曲线同样按深度分层，每层的浓淡与粗细都朝墨色插值，因此是逐渐变黑而不是突变。
+  for (const s of special) {
+    const own = Array.from({ length: DEPTH_LAYERS }, () => new Path2D());
+    traceDepthLayers(own, s.scr, s.depth);
+    own.forEach((path, i) => {
+      ctx.strokeStyle = inkStyle(i, s.ink);
+      ctx.lineWidth = lerp(DEPTH_WIDTH[i], INK_WIDTH, s.ink) + s.bold * TEXT_BOLD_EXTRA;
+      ctx.stroke(path);
+    });
+    const baseWidth = lerp(0.65, INK_WIDTH, s.ink) + s.bold * TEXT_BOLD_EXTRA;
+    const extraWidth = s.displayWidth - 0.65;
+    if (extraWidth > 0.01) drawEmphasis(s, baseWidth, extraWidth);
+  }
+
+  // 结：同一实色灰阶的结合并填充
+  const knotGroups = new Map();
+  const t = performance.now();
+  knots.forEach((k, ki) => {
+    if (!k.onScreen) return;
+    const color = toneColor(lerp(restDarkness(k.layer), 1, Math.max(k.ink, k.grow)));
+    let path = knotGroups.get(color);
+    if (!path) knotGroups.set(color, path = new Path2D());
+    // 悬停：结稍稍变大，并以两个不相干的频率轻轻抖动。
+    const r = (1.5 + Math.sqrt(k.memberCount) * 0.8) * DEPTH_KNOT[k.layer] * (1 + 0.45 * k.grow);
+    const amp = 1.3 * k.grow;
+    const x = k.sx + amp * (Math.sin(t * 0.047 + ki) + 0.5 * Math.sin(t * 0.113 + ki * 2.3));
+    const y = k.sy + amp * (Math.cos(t * 0.053 + ki * 1.7) + 0.5 * Math.cos(t * 0.097 + ki));
+    path.moveTo(x + r, y);
+    path.arc(x, y, r, 0, Math.PI * 2);
+  });
+  for (const [color, path] of knotGroups) {
+    ctx.fillStyle = color;
+    ctx.fill(path);
+  }
+
+  if (focusStrand >= 0) {
+    // 聚焦：在曲线上方逐句标出全诗，随手指/鼠标抚摸高亮对应诗句
+    drawFocusPoem(focusStrand);
+  }
+  if (readingReturn?.exitingReading) drawStraightPoem(readingReturn.exitingReading);
+  drawKnotText();
+
+  // 标题跟随鼠标，字号不受视野缩放影响。
+  if (titleText && titleAlpha > 0) {
+    const title = titleText;
+    ctx.font = `20px ${BRUSH}`;
+    ctx.fillStyle = `rgba(32,32,32,${titleAlpha})`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const maxWidth = Math.max(1, W - 24);
+    const width = Math.min(ctx.measureText(title).width, maxWidth);
+    let x = titlePosition.x - width / 2;
+    let y = titlePosition.y - 44;
+    if (y < 12) y = titlePosition.y + 16;
+    x = clamp(x, 12, Math.max(12, W - width - 12));
+    y = clamp(y, 12, Math.max(12, H - 40));
+    ctx.fillText(title, x, y, maxWidth);
+  }
+  ctx.restore();
+}
+
+/* ============ 主循环：只有画面确实变化时才重绘 ============ */
+let lastFrameTime = null;
+// Resume from a fresh frame delta after a background tab becomes visible.
+document.addEventListener("visibilitychange", () => { lastFrameTime = null; });
+function frame(now) {
+  const transitionDt = lastFrameTime === null ? 0 : Math.max(0, now - lastFrameTime);
+  const dt = Math.min(transitionDt, 64);
+  lastFrameTime = now;
+  setPhysicsPaused(focusStrand >= 0 || lockedKnot >= 0 || !!readingReturn);
+  if (!physicsWorker && !physicsPaused && !layoutSleeping && !dragging) {
+    // 退回主线程时：每帧最多一步、每秒最多约 60 步，不追赶积压步骤，以免阻塞交互。
+    physicsElapsed += dt;
+    if (physicsElapsed >= PHYSICS_INTERVAL) {
+      mainThreadSim.step();
+      applyPositions(mainThreadSim.pos);
+      layoutSleeping = mainThreadSim.sleeping;
+      physicsElapsed %= PHYSICS_INTERVAL;
+    }
+  }
+  applyCameraAnim();
+  tickOverviewDrift(transitionDt);
+  if (!dragging && (spin.yaw || spin.pitch)) {
+    rotateView(spin.yaw * dt, spin.pitch * dt);
+    const decay = Math.exp(-dt / 320);
+    spin.yaw *= decay; spin.pitch *= decay;
+    if (Math.abs(spin.yaw) + Math.abs(spin.pitch) < 1e-6) { spin.yaw = 0; spin.pitch = 0; }
+  }
+  setBasis(view);
+  tickStraightReading(now, dt);
+  updateSamples();
+  if (projectScene()) { needsRedraw = true; pickDirty = true; }
+
+  // 鼠标移动或画面转动后才重新命中检测；悬停延时结束时补做一次。
+  if (pickDirty || (!hoverArmed && now >= hoverReadyAt)) {
+    if (now >= hoverReadyAt) hoverArmed = true;
+    pickHover();
+    pickDirty = false;
+  }
+
+  updateTitleHover(now);
+
+  const activeStrand = hoverStrand >= 0 ? hoverStrand : focusStrand;
+  const activeKnot = lockedKnot; // 悬停结只让它自己变大抖动，不再牵动诗线
+
+  // 线宽与墨色过渡：墨色比粗细慢一些，让线条"慢慢变黑"。
+  const widthBlend = 1 - Math.exp(-transitionDt / 150);
+  const inkBlend = 1 - Math.exp(-transitionDt / 350);
+  const ease = (value, target, blend, epsilon) => {
+    if (Math.abs(value - target) <= epsilon) return target;
+    needsRedraw = true;
+    return lerp(value, target, blend);
+  };
+  dimLevel = ease(dimLevel, focusStrand >= 0 || lockedKnot >= 0 ? 1 : 0, inkBlend, 0.002);
+  const knotStrands = activeKnot >= 0 ? knots[activeKnot].strands : null;
+  knots.forEach((k, ki) => {
+    const focused = activeKnot === ki || (activeStrand >= 0 && k.strands.has(activeStrand));
+    const knotInk = reading
+      ? k.strands.has(reading.si) ? 1 : [...k.strands].some(si => reading.related.has(si)) ? 0.3 : 0
+      : focused ? 1 : 0;
+    k.ink = ease(k.ink, knotInk, inkBlend, 0.002);
+    k.grow = ease(k.grow, !dragging && hoverKnot === ki ? 1 : 0, widthBlend, 0.002);
+    if (k.grow > 0) needsRedraw = true; // 抖动需要逐帧重绘
+  });
+  knotTextLevel = ease(knotTextLevel, lockedKnot >= 0 && !camAnim ? 1 : 0, inkBlend, 0.002);
+  // 结的局部视图里，线与诗句双向联动：悬停任一方，另一方同步变深。
+  const textStrand = lockedKnot >= 0 && knotTextHover >= 0 ? knotEntryStrand(knotTextHover) : -1;
+  if (knotLayout && lockedKnot === knotLayout.ki) {
+    knots[lockedKnot].entries.forEach((e, i) => {
+      const si = knotEntryStrand(i);
+      knotLayout.lit[i] = ease(knotLayout.lit[i], si === hoverStrand || si === textStrand ? 1 : 0, inkBlend, 0.002);
+    });
+  }
+  strands.forEach((s, si) => {
+    // 结的相关诗线平时是中等墨色，被悬停（线或诗句）的那一条才到全黑。
+    const lit = activeStrand === si || textStrand === si;
+    const focused = reading
+      ? si === reading.si ? 1 : reading.related.has(si) ? (hoverStrand === si ? 0.48 : 0.3) : 0
+      : lit ? 1 : knotStrands !== null && knotStrands.has(si) ? (lockedKnot >= 0 ? 0.55 : 1) : 0;
+    s.displayWidth = ease(s.displayWidth, !dragging && hoverStrand === si ? HOVER_WIDTH : 0.65, widthBlend, 0.005);
+    s.ink = ease(s.ink, focused, inkBlend, 0.002);
+    s.bold = ease(s.bold, textStrand === si ? 1 : 0, inkBlend, 0.002);
+    if (!dragging && hoverStrand === si && mouseScreen.x >= 0) s.emphasisDir = unproject(mouseScreen.x, mouseScreen.y);
+  });
+
+  if (needsRedraw) {
+    needsRedraw = false;
+    draw();
+  }
+
+  exitFocusBtn.classList.toggle("show", focusStrand >= 0 || lockedKnot >= 0);
+
+  requestAnimationFrame(frame);
+}
+
+// 每个结经过哪些诗线，用于高亮时 O(1) 查询。
+knots.forEach(k => { k.strands = new Set(); k.ink = 0; k.grow = 0; });
+strands.forEach((s, si) => s.nodes.forEach(n => { if (n.isKnot) n.strands.add(si); }));
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  needsRedraw = true;
+  if (reading) {
+    reading.metrics = readingMetrics(reading.si);
+    reading.scrollTarget = clamp(reading.scrollTarget, 0, Math.max(0, reading.metrics.total - H * .5));
+    pickDirty = true;
+  }
+  if (lockedKnot >= 0) {
+    if (readingReturn?.exitingReading) readingReturn.refitKnot = true;
+    else { knotLayout = computeKnotView(lockedKnot); tweenViewTo(knotLayout.view, 250); }
+  }
+}
+window.addEventListener("resize", resize);
+
+// Start the animation loop after the reading geometry script has loaded.
+</script>
+<script src="assets/straight-reading.js"></script>
+<script>resize(); requestAnimationFrame(frame);</script>
+</body>
+</html>
